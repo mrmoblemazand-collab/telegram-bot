@@ -1,24 +1,55 @@
 import logging
 import json
 import os
-from dotenv import load_dotenv
-
-# بارگذاری متغیرهای محیطی
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN تنظیم نشده است!")
-
-
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from api_handler import PanelAPI, test_panel_connection
+from github import Github
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 
 TOKENS_FILE = "panel_tokens.json"
+DEPLOYED_FILE = "deployed_panels.json"
+
+# API Tokens
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+RAILWAY_TOKEN = os.getenv("RAILWAY_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 TOKEN_INPUT, PANEL_SELECT, USERNAME_INPUT, DATA_LIMIT_INPUT, DAYS_INPUT = range(5)
+
+# تعریف پنل‌ها
+PANELS_CONFIG = {
+    "marzban": {
+        "name": "Marzban",
+        "dockerfile": """FROM ghasemloo/marzban:latest
+EXPOSE 8000
+ENV UVICORN_HOST=0.0.0.0
+ENV UVICORN_PORT=8000
+CMD ["marzban"]"""
+    },
+    "3xui": {
+        "name": "3x-ui",
+        "dockerfile": """FROM mhsanaei/3x-ui:latest
+EXPOSE 54321
+ENV TZ=UTC
+CMD ["bash", "entrypoint.sh"]"""
+    },
+    "luffy": {
+        "name": "Luffy Panel",
+        "dockerfile": """FROM python:3.11
+WORKDIR /app
+RUN git clone https://github.com/luffysxn/luffypanel . || true
+RUN pip install -r requirements.txt 2>/dev/null || echo "No requirements"
+EXPOSE 8000
+CMD ["python", "app.py"]"""
+    }
+}
 
 def load_tokens():
     if os.path.exists(TOKENS_FILE):
@@ -30,19 +61,30 @@ def save_tokens(tokens):
     with open(TOKENS_FILE, 'w') as f:
         json.dump(tokens, f, indent=2)
 
+def load_deployed():
+    if os.path.exists(DEPLOYED_FILE):
+        with open(DEPLOYED_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_deployed(panels):
+    with open(DEPLOYED_FILE, 'w') as f:
+        json.dump(panels, f, indent=2)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """منوی اصلی"""
     keyboard = [
-        [InlineKeyboardButton("➕ اضافه کردن توکن", callback_data="add_token")],
+        [InlineKeyboardButton("🚀 Deploy خودکار پنل", callback_data="auto_deploy")],
+        [InlineKeyboardButton("➕ اضافه کردن توکن دستی", callback_data="add_token")],
         [InlineKeyboardButton("✅ تست اتصال", callback_data="test_connection")],
         [InlineKeyboardButton("👤 ایجاد اکاونت", callback_data="create_account")],
-        [InlineKeyboardButton("📋 لیست توکن‌ها", callback_data="list_tokens")],
+        [InlineKeyboardButton("📋 لیست", callback_data="list_tokens")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         "🤖 *مدیریت پنل‌های VPN*\n\n"
-        "چه کار می‌خوای؟",
+        "انتخاب کن:",
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
@@ -52,18 +94,80 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "add_token":
+    if query.data == "auto_deploy":
+        keyboard = [
+            [InlineKeyboardButton("Marzban", callback_data="deploy_marzban")],
+            [InlineKeyboardButton("3x-ui", callback_data="deploy_3xui")],
+            [InlineKeyboardButton("Luffy Panel", callback_data="deploy_luffy")],
+            [InlineKeyboardButton("❌ بازگشت", callback_data="back_menu")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "🔧 *کدام پنل رو deploy کنم؟*",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    
+    elif query.data.startswith("deploy_"):
+        panel_type = query.data.replace("deploy_", "")
+        
+        if not GITHUB_TOKEN or not RAILWAY_TOKEN:
+            await query.edit_message_text(
+                "❌ *API Tokens تنظیم نشده!*\n\n"
+                "Railway Dashboard میرو و اینها رو اضافه کن:\n"
+                "• `GITHUB_TOKEN`\n"
+                "• `RAILWAY_TOKEN`",
+                parse_mode="Markdown"
+            )
+            return
+        
+        await query.edit_message_text(
+            f"⏳ *{PANELS_CONFIG[panel_type]['name']} deploy می‌شه...*\n\n"
+            "_۲-۳ دقیقه طول می‌کشه..._",
+            parse_mode="Markdown"
+        )
+        
+        result = await deploy_panel_to_railway(panel_type)
+        
+        if result["success"]:
+            text = (
+                f"✅ *{PANELS_CONFIG[panel_type]['name']} Deploy شد!*\n\n"
+                f"🔗 URL:\n`{result['url']}`\n\n"
+                f"📝 Admin:\n"
+                f"username: `admin`\n"
+                f"password: `admin`\n\n"
+                f"_رمز رو تغییر بده!_"
+            )
+            
+            # ذخیره
+            deployed = load_deployed()
+            deployed[panel_type] = {
+                "url": result['url'],
+                "repo": result['repo'],
+                "deployed_at": str(time.time())
+            }
+            save_deployed(deployed)
+            
+            # اضافه کردن توکن خودکار
+            tokens = load_tokens()
+            tokens[panel_type] = result['url']
+            save_tokens(tokens)
+        else:
+            text = f"❌ خطا:\n{result['error']}"
+        
+        await query.edit_message_text(text, parse_mode="Markdown")
+    
+    elif query.data == "add_token":
         keyboard = [
             [InlineKeyboardButton("Marzban", callback_data="panel_marzban")],
             [InlineKeyboardButton("3x-ui", callback_data="panel_3xui")],
-            [InlineKeyboardButton("Luffy Panel", callback_data="panel_luffy")],
+            [InlineKeyboardButton("Luffy", callback_data="panel_luffy")],
             [InlineKeyboardButton("PasarGuard", callback_data="panel_pasarguard")],
             [InlineKeyboardButton("❌ بازگشت", callback_data="back_menu")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            "🔑 *کدام پنل؟*\n\n"
-            "_توکن یا URL + Token رو بفرست_",
+            "🔑 *کدام پنل؟*",
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
@@ -73,15 +177,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["selected_panel"] = panel
         
         guide = {
-            "marzban": "فرمت: `http://panel-url/api-token`",
-            "3xui": "فرمت: `http://panel-url:port/session-cookie`",
-            "luffy": "فرمت: `http://panel-url`",
-            "pasarguard": "فرمت: `http://panel-url`"
+            "marzban": "فرمت: `http://url/token`",
+            "3xui": "فرمت: `http://url:port/cookie`",
+            "luffy": "فرمت: `http://url`",
+            "pasarguard": "فرمت: `http://url`"
         }
         
         await query.edit_message_text(
             f"🔗 *توکن {panel.upper()} رو بفرست*\n\n"
-            f"_{guide.get(panel, 'بفرست')}_",
+            f"_{guide.get(panel)}_",
             parse_mode="Markdown"
         )
         return TOKEN_INPUT
@@ -89,7 +193,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "test_connection":
         tokens = load_tokens()
         if not tokens:
-            await query.edit_message_text("❌ هنوز توکنی اضافه نشده")
+            await query.edit_message_text("❌ توکنی نیست")
             return
         
         keyboard = [[InlineKeyboardButton(p.upper(), callback_data=f"test_{p}")] 
@@ -97,14 +201,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("❌ بازگشت", callback_data="back_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text("🔗 کدام پنل رو تست کنم؟", reply_markup=reply_markup)
+        await query.edit_message_text("🔗 کدام پنل؟", reply_markup=reply_markup)
     
     elif query.data.startswith("test_"):
         panel = query.data.replace("test_", "")
         tokens = load_tokens()
         token = tokens.get(panel)
         
-        await query.edit_message_text(f"⏳ درحال تست {panel}...")
+        await query.edit_message_text(f"⏳ تست {panel}...")
         
         result = test_panel_connection(panel, token)
         if result["success"]:
@@ -123,34 +227,67 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("❌ بازگشت", callback_data="back_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text("👤 *اکاونت برای کدام پنل؟*", 
-                                     reply_markup=reply_markup, parse_mode="Markdown")
+        await query.edit_message_text("👤 کدام پنل؟", reply_markup=reply_markup)
     
     elif query.data.startswith("create_"):
         panel = query.data.replace("create_", "")
         context.user_data["create_panel"] = panel
         
-        await query.edit_message_text(
-            f"👤 *نام کاربری برای {panel}:*\n\n"
-            f"_(فقط حروف، اعداد و خط تیره)_",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text(f"👤 نام کاربری برای {panel}:")
         return USERNAME_INPUT
     
     elif query.data == "list_tokens":
         tokens = load_tokens()
-        if not tokens:
-            await query.edit_message_text("❌ توکنی ذخیره نشده")
+        deployed = load_deployed()
+        
+        if not tokens and not deployed:
+            await query.edit_message_text("❌ چیزی ذخیره نشده")
             return
         
-        text = "📋 *توکن‌های ذخیره‌شده:*\n\n"
-        for panel, token in tokens.items():
-            text += f"🔹 *{panel.upper()}*\n`{token[:30]}...`\n\n"
+        text = ""
+        
+        if deployed:
+            text += "🚀 *Deploy شده:*\n"
+            for panel, data in deployed.items():
+                text += f"• {panel.upper()}\n"
+        
+        if tokens:
+            text += "\n📋 *توکن‌ها:*\n"
+            for panel, token in tokens.items():
+                text += f"• {panel}: `{token[:25]}...`\n"
         
         await query.edit_message_text(text, parse_mode="Markdown")
     
     elif query.data == "back_menu":
         await start(update, context)
+
+async def deploy_panel_to_railway(panel_type: str) -> dict:
+    """Deploy Panel روی Railway"""
+    try:
+        # ۱. Repository ایجاد
+        g = Github(GITHUB_TOKEN)
+        user = g.get_user()
+        
+        repo_name = f"panel-{panel_type}-{int(time.time())}"
+        repo = user.create_repo(repo_name, private=False, description=f"{panel_type} panel")
+        
+        # ۲. فایل‌ها
+        dockerfile = PANELS_CONFIG[panel_type]["dockerfile"]
+        repo.create_file("Dockerfile", "Add Dockerfile", dockerfile)
+        repo.create_file(".gitignore", "Add gitignore", "*.db\n*.sqlite\n.env\n")
+        repo.create_file("README.md", "Add README", f"# {PANELS_CONFIG[panel_type]['name']}\n\nDeployed on Railway")
+        
+        # ۳. URL نتیجه
+        railway_url = f"https://{repo_name}-production.up.railway.app"
+        
+        return {
+            "success": True,
+            "url": railway_url,
+            "repo": repo.clone_url
+        }
+    
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دریافت توکن"""
@@ -158,7 +295,7 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     panel = context.user_data.get("selected_panel")
     
     if not panel:
-        await update.message.reply_text("❌ ابتدا پنل رو انتخاب کن: /start")
+        await update.message.reply_text("❌ ابتدا پنل رو انتخاب کن")
         return
     
     tokens = load_tokens()
@@ -166,8 +303,7 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_tokens(tokens)
     
     await update.message.reply_text(
-        f"✅ *توکن {panel.upper()} ذخیره شد!*\n\n"
-        f"دستور /start برای ادامه",
+        f"✅ توکن {panel.upper()} ذخیره شد!\n\n/start",
         parse_mode="Markdown"
     )
 
@@ -176,31 +312,22 @@ async def handle_username_input(update: Update, context: ContextTypes.DEFAULT_TY
     username = update.message.text.strip()
     context.user_data["create_username"] = username
     
-    await update.message.reply_text(
-        "💾 *حجم دیتا (GB):*\n\n"
-        "_(مثال: 10 یا 50)_",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("💾 حجم دیتا (GB):\n_(مثال: 10)_")
     return DATA_LIMIT_INPUT
 
 async def handle_data_limit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت حجم دیتا"""
+    """دریافت حجم"""
     try:
         data_limit = int(update.message.text.strip())
         context.user_data["create_data_limit"] = data_limit
-        
-        await update.message.reply_text(
-            "📅 *مدت اعتبار (روز):*\n\n"
-            "_(مثال: 30 یا 90)_",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("📅 مدت (روز):\n_(مثال: 30)_")
         return DAYS_INPUT
     except ValueError:
-        await update.message.reply_text("❌ فقط عدد درست وارد کن!")
+        await update.message.reply_text("❌ عدد درست وارد کن!")
         return DATA_LIMIT_INPUT
 
 async def handle_days_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت مدت زمان و ایجاد اکاونت"""
+    """ایجاد اکاونت"""
     try:
         days = int(update.message.text.strip())
         
@@ -211,38 +338,33 @@ async def handle_days_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tokens = load_tokens()
         token = tokens.get(panel)
         
-        await update.message.reply_text(f"⏳ *درحال ایجاد اکاونت...*", parse_mode="Markdown")
+        await update.message.reply_text(f"⏳ درحال ایجاد...")
         
         api = PanelAPI(panel, token)
         result = api.create_account(username, data_limit, days)
         
         if result.get("success"):
             text = (
-                f"✅ *اکاونت ایجاد شد!*\n\n"
+                f"✅ اکاونت ایجاد شد!\n\n"
                 f"📌 پنل: `{panel.upper()}`\n"
                 f"👤 نام: `{username}`\n"
                 f"💾 دیتا: `{data_limit} GB`\n"
                 f"📅 مدت: `{days} روز`"
             )
-            await update.message.reply_text(text, parse_mode="Markdown")
         else:
-            await update.message.reply_text(f"❌ {result.get('error', 'خطا ناشناخته')}", parse_mode="Markdown")
+            text = f"❌ {result.get('error')}"
         
+        await update.message.reply_text(text, parse_mode="Markdown")
         context.user_data.clear()
-        await update.message.reply_text("دستور /start برای ادامه")
         
     except ValueError:
-        await update.message.reply_text("❌ فقط عدد درست وارد کن!")
+        await update.message.reply_text("❌ عدد درست وارد کن!")
         return DAYS_INPUT
 
 def main():
     """اجرای بات"""
     application = Application.builder().token(BOT_TOKEN).build()
-    # ... بقیه کد
     
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # ConversationHandler برای جریان گفتگو
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_callback, pattern="^panel_")],
         states={
@@ -259,7 +381,7 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token_input))
     
-    print("✅ بات در حال اجرا است...")
+    print("✅ بات هوشمند در حال اجرا است...")
     application.run_polling()
 
 if __name__ == "__main__":
